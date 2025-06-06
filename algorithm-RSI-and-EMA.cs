@@ -74,6 +74,7 @@ public class BetterCryptoRsiEmaAlgo : QCAlgorithm
     private const decimal RSIOverSold      = 30.0m;      // RSI oversold threshold
     private const decimal EMAUptrendPct = 0.0002m; // 0.02 % per bar (normalized slope)
     private const decimal EMADowntrendPct = -0.0002m; // -0.02 % per bar (normalized slope)
+    private bool _debug = false; // Set to true to enable detailed debug logs
 
     // --- State -------------------------------------------------------------
     private readonly Dictionary<Symbol, RelativeStrengthIndex> _rsi = new();
@@ -82,8 +83,8 @@ public class BetterCryptoRsiEmaAlgo : QCAlgorithm
     private bool _haltTrading;
     private decimal _btcStartPrice;
     private bool _initialValueRecorded = false;
-    private readonly Dictionary<Symbol, int> _liveTicksForSymbol = new();
-    private const int MinLiveTicksForSlopeCalc = SlopeLookbackBars + 3; // e.g., 5 + 3 = 8 five-minute bars
+    private readonly Dictionary<Symbol, int> _postWarmupOneMinuteTicksForSymbol = new();
+    private const int MinPostWarmupOneMinuteTicksForSlopeCalc = (SlopeLookbackBars - 1) * 5; // e.g. (n-1) * 5-min bars = 4 x 5-min = 20 min
     private int _onDataCallCountAfterWarmup = 0; // General counter for OnData calls post-warmup
 
     // -----------------------------------------------------------------------
@@ -99,7 +100,7 @@ public class BetterCryptoRsiEmaAlgo : QCAlgorithm
         {
             var security = AddCrypto(ticker, Resolution.Minute, Market.Coinbase);
             var symbol = security.Symbol;
-            _liveTicksForSymbol[symbol] = 0; // Initialize counter for each symbol
+            _postWarmupOneMinuteTicksForSymbol[symbol] = 0; // Initialize counter for each symbol
 
             var fiveMinConsolidator = ResolveConsolidator(symbol, TimeSpan.FromMinutes(5));
 
@@ -124,20 +125,25 @@ public class BetterCryptoRsiEmaAlgo : QCAlgorithm
             if (hist != null && hist.Any())
             {
                 _btcStartPrice = hist.First().Close;
-                Log($"DEBUG: BTC Start Price for benchmark: {_btcStartPrice} at {hist.First().Time}");
+                if (_debug) {
+                    Log($"DEBUG: BTC Start Price for benchmark: {_btcStartPrice} at {hist.First().Time}");
+                }
             }
-            else
-            {
-                Log("WARNING: Could not retrieve BTC history for benchmark start price during Initialize.");
-                _btcStartPrice = 0m;
-            }
+                else
+                {
+                    Log("WARNING: Could not retrieve BTC history for benchmark start price during Initialize.");
+                    _btcStartPrice = 0m;
+                }
         }
         catch (Exception ex)
         {
             Log($"ERROR: Getting BTC history in Initialize: {ex.Message}");
             _btcStartPrice = 0m;
         }
-        Log("DEBUG: Initialize completed.");
+        if (_debug)
+        {
+            Log("DEBUG: Initialize completed.");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -146,7 +152,10 @@ public class BetterCryptoRsiEmaAlgo : QCAlgorithm
         if (IsWarmingUp) return;
 
         _onDataCallCountAfterWarmup++;
-        Log($"DEBUG: OnData Post-Warmup Call #{_onDataCallCountAfterWarmup} at {Time}. Slice contains keys: {string.Join(",", data.Keys.Select(k => k.Value))}");
+        if (_debug)
+        {
+            Log($"DEBUG: OnData Post-Warmup Call #{_onDataCallCountAfterWarmup} at {Time}. Slice contains keys: {string.Join(",", data.Keys.Select(k => k.Value))}");
+        }
 
 
         // Capture initial portfolio value once, right after warm-up completes
@@ -172,7 +181,10 @@ public class BetterCryptoRsiEmaAlgo : QCAlgorithm
 
         if (_haltTrading)
         {
-            Log($"DEBUG: Trading is halted at {Time}.");
+            if (_debug)
+            {
+                Log($"DEBUG: Trading is halted at {Time}.");
+            }
             return;
         }
 
@@ -193,10 +205,13 @@ public class BetterCryptoRsiEmaAlgo : QCAlgorithm
             // This case means we are past warmup, but _initialValue is still not set (e.g. if Portfolio.TotalPortfolioValue was 0 on first try)
             // We might want to prevent trading or log a warning, as circuit breaker cannot function yet.
             // For simplicity here, we let it pass, and it will try to record _initialValue again on the next OnData.
-            // Debug("Circuit breaker cannot operate as initial portfolio value is not yet recorded.");
+            // if (_debug)
+            // {
+            //  Debug("Circuit breaker cannot operate as initial portfolio value is not yet recorded.");
+            // }
         }
 
-        foreach (var symbol in _rsi.Keys) // Or _ema.Keys, or _liveTicksForSymbol.Keys
+        foreach (var symbol in _rsi.Keys) // Or _ema.Keys, or _postWarmupOneMinuteTicksForSymbol.Keys
         {
             // Check if data for this symbol exists in the current slice
             if (!data.ContainsKey(symbol) || data[symbol] == null)
@@ -206,23 +221,23 @@ public class BetterCryptoRsiEmaAlgo : QCAlgorithm
             }
 
             // Increment live tick counter only if we have data for this symbol
-            _liveTicksForSymbol[symbol]++;
+            _postWarmupOneMinuteTicksForSymbol[symbol]++;
 
             var rsi = _rsi[symbol]; // Now 'symbol' is guaranteed to be a key
             var ema = _ema[symbol]; // Same here
 
             if (!rsi.IsReady || !ema.IsReady)
             {
-                Log($"INFO: Indicators not ready for {symbol} at {Time}. RSI Ready: {rsi.IsReady} (Samples: {rsi.Samples}), EMA Ready: {ema.IsReady} (Samples: {ema.Samples}). Live ticks for symbol: {_liveTicksForSymbol[symbol]}");
+                Log($"INFO: Indicators not ready for {symbol} at {Time}. RSI Ready: {rsi.IsReady} (Samples: {rsi.Samples}), EMA Ready: {ema.IsReady} (Samples: {ema.Samples}). Live ticks for symbol: {_postWarmupOneMinuteTicksForSymbol[symbol]}");
                 continue;
             }
 
             decimal calculatedEmaSlope = 0m;
 
             // Defer slope calculation until enough live 5-minute bars have been processed for this symbol
-            if (_liveTicksForSymbol[symbol] < MinLiveTicksForSlopeCalc)
+            if (_postWarmupOneMinuteTicksForSymbol[symbol] < MinPostWarmupOneMinuteTicksForSlopeCalc)
             {
-                Log($"INFO: SLOPE DEFERRED for {symbol} at {Time}: Waiting for more live 5-min bars. Live 5-min ticks for symbol: {_liveTicksForSymbol[symbol]}/{MinLiveTicksForSlopeCalc}. EMA Samples: {ema.Samples}.");
+                Log($"INFO: SLOPE DEFERRED for {symbol} at {Time}: Waiting for more 1-min data ticks. Post-Warmup 1-min Ticks: {_postWarmupOneMinuteTicksForSymbol[symbol]}/{MinPostWarmupOneMinuteTicksForSlopeCalc}. EMA Samples: {ema.Samples}.");
                 // calculatedEmaSlope remains 0m
             }
             else if (ema.Samples >= SlopeLookbackBars) // EMA must have at least processed SlopeLookbackBars number of 5-min bars
@@ -237,7 +252,7 @@ public class BetterCryptoRsiEmaAlgo : QCAlgorithm
                         // Corrected check: Focus on whether the IndicatorDataPoint objects themselves are null
                         if (currentEmaDataPoint == null || pastEmaDataPoint == null)
                         {
-                            Log($"WARNING: SLOPE CALC for {symbol} at {Time}: EMA Current or Past IndicatorDataPoint is NULL. Current Exists: {currentEmaDataPoint != null}, Past (ema[{SlopeLookbackBars - 1}]) Exists: {pastEmaDataPoint != null}. EMA IsReady (overall): {ema.IsReady}, EMA Samples: {ema.Samples}, Live 5-min Ticks: {_liveTicksForSymbol[symbol]}. Slope set to 0.");
+                            Log($"WARNING: SLOPE CALC for {symbol} at {Time}: EMA Current or Past IndicatorDataPoint is NULL. Current Exists: {currentEmaDataPoint != null}, Past (ema[{SlopeLookbackBars - 1}]) Exists: {pastEmaDataPoint != null}. EMA IsReady (overall): {ema.IsReady}, EMA Samples: {ema.Samples}, Post-Warmup 1-min Ticks: {_postWarmupOneMinuteTicksForSymbol[symbol]}. Slope set to 0.");
                             calculatedEmaSlope = 0m;
                         }
                         else
@@ -248,11 +263,11 @@ public class BetterCryptoRsiEmaAlgo : QCAlgorithm
                             if (pastEmaValue != 0m)
                             {
                                 calculatedEmaSlope = (currentEmaValue - pastEmaValue) / pastEmaValue / (SlopeLookbackBars - 1);
-                                Log($"INFO: SLOPE CALC SUCCESS for {symbol} at {Time}: Slope={calculatedEmaSlope:0.######}. CurrentEMA: {currentEmaValue:F4}, PastEMA (ema[{SlopeLookbackBars - 1}]): {pastEmaValue:F4}. Live 5-min Ticks: {_liveTicksForSymbol[symbol]}");
+                                Log($"INFO: SLOPE CALC SUCCESS for {symbol} at {Time}: Slope={calculatedEmaSlope:0.######}. CurrentEMA: {currentEmaValue:F4}, PastEMA (ema[{SlopeLookbackBars - 1}]): {pastEmaValue:F4}. Post-Warmup 1-min Ticks: {_postWarmupOneMinuteTicksForSymbol[symbol]}");
                             }
                             else
                             {
-                                Log($"WARNING: SLOPE CALC for {symbol} at {Time}: Past EMA value (ema[{SlopeLookbackBars - 1}]) is 0. Slope set to 0. Live 5-min Ticks: {_liveTicksForSymbol[symbol]}");
+                                Log($"WARNING: SLOPE CALC for {symbol} at {Time}: Past EMA value (ema[{SlopeLookbackBars - 1}]) is 0. Slope set to 0. Post-Warmup 1-min Ticks: {_postWarmupOneMinuteTicksForSymbol[symbol]}");
                                 calculatedEmaSlope = 0m;
                             }
                         }
@@ -265,17 +280,17 @@ public class BetterCryptoRsiEmaAlgo : QCAlgorithm
                         // Corrected check
                         if (currentEmaDataPoint == null || previousEmaDataPoint == null)
                         {
-                             Log($"WARNING: SLOPE CALC (1-bar lookback) for {symbol} at {Time}: EMA Current or Previous IndicatorDataPoint is NULL. Current Exists: {currentEmaDataPoint != null}, Previous Exists: {previousEmaDataPoint != null}. Slope set to 0. Live 5-min Ticks: {_liveTicksForSymbol[symbol]}");
+                            Log($"WARNING: SLOPE CALC (1-bar lookback) for {symbol} at {Time}: EMA Current or Previous IndicatorDataPoint is NULL. ... Post-Warmup 1-min Ticks: {_postWarmupOneMinuteTicksForSymbol[symbol]}.");
                             calculatedEmaSlope = 0m;
                         }
                         else if (previousEmaDataPoint.Value != 0m)
                         {
                             calculatedEmaSlope = (currentEmaDataPoint.Value - previousEmaDataPoint.Value) / previousEmaDataPoint.Value;
-                            Log($"INFO: SLOPE CALC SUCCESS (1-bar lookback) for {symbol} at {Time}: Slope={calculatedEmaSlope:0.######}. Live 5-min Ticks: {_liveTicksForSymbol[symbol]}");
+                            Log($"INFO: SLOPE CALC SUCCESS (1-bar lookback) for {symbol} at {Time}: Slope={calculatedEmaSlope:0.######}. Live 5-min Ticks: {_postWarmupOneMinuteTicksForSymbol[symbol]}");
                         }
                         else
                         {
-                            Log($"WARNING: SLOPE CALC (1-bar lookback) for {symbol} at {Time}: EMA Previous value is 0. Slope set to 0. Live 5-min Ticks: {_liveTicksForSymbol[symbol]}");
+                            Log($"WARNING: SLOPE CALC (1-bar lookback) for {symbol} at {Time}: EMA Previous value is 0. Slope set to 0. Live 5-min Ticks: {_postWarmupOneMinuteTicksForSymbol[symbol]}");
                             calculatedEmaSlope = 0m;
                         }
                     }
@@ -289,7 +304,7 @@ public class BetterCryptoRsiEmaAlgo : QCAlgorithm
             }
             else
             {
-                 Log($"INFO: SLOPE DEFERRED for {symbol} at {Time}: EMA not yet enough samples ({ema.Samples}) for lookback ({SlopeLookbackBars}). Needs at least {SlopeLookbackBars} samples. Live 5-min Ticks: {_liveTicksForSymbol[symbol]}.");
+                Log($"INFO: SLOPE DEFERRED for {symbol} at {Time}: EMA not yet enough samples ({ema.Samples}) for lookback ({SlopeLookbackBars}). Needs at least {SlopeLookbackBars} samples. Post-Warmup 1-min Ticks: {_postWarmupOneMinuteTicksForSymbol[symbol]}.");
             }
 
             var holdings = Portfolio[symbol].Quantity;
@@ -297,7 +312,10 @@ public class BetterCryptoRsiEmaAlgo : QCAlgorithm
             bool upTrend = calculatedEmaSlope > EMAUptrendPct;
             bool downTrend = calculatedEmaSlope < EMADowntrendPct;
 
-            Log($"DEBUG: TRADE CHECK for {symbol} at {Time}: Holdings: {holdings}, RSI: {rsi.Current.Value:F2}, CalcEMASlope: {calculatedEmaSlope:F6} (IsUpTrend: {upTrend}), TargetSlopeForUptrend: {EMAUptrendPct}, RSIOversold: {RSIOverSold}. Live 5-min Ticks: {_liveTicksForSymbol[symbol]}.");
+            if (_debug)
+            {
+                Log($"DEBUG: TRADE CHECK for {symbol} at {Time}: Holdings: {holdings}, RSI: {rsi.Current.Value:F2}, CalcEMASlope: {calculatedEmaSlope:F6} (IsUpTrend: {upTrend}), TargetSlopeForUptrend: {EMAUptrendPct}, RSIOversold: {RSIOverSold}. Live 5-min Ticks: {_postWarmupOneMinuteTicksForSymbol[symbol]}.");
+            }
 
             // ---------- Entries --------------------------------------------
             if (holdings == 0 && rsi.Current.Value < RSIOverSold && upTrend)
@@ -305,7 +323,10 @@ public class BetterCryptoRsiEmaAlgo : QCAlgorithm
                 Log($"ACTION: ENTRY SIGNAL for {symbol} at {Time}: RSI ({rsi.Current.Value:F2}) < {RSIOverSold} AND EMA Slope ({calculatedEmaSlope:F6}) > {EMAUptrendPct}. Attempting SetHoldings({PositionPct:P0}).");
                 SetHoldings(symbol, PositionPct, false, $"Entry: RSI < {RSIOverSold} & EMA UpTrend");
                 // SetHoldings is asynchronous. Order fills will be handled by OnOrderEvent.
-                // Debug($"{Time} BUY {symbol} | RSI {rsi.Current:0.##} EMA-slope {calculatedEmaSlope:0.#####}");
+                // if (_debug)
+                // {
+                //  Debug($"{Time} BUY {symbol} | RSI {rsi.Current:0.##} EMA-slope {calculatedEmaSlope:0.#####}");
+                // }
                 continue; // Process next symbol
             }
 
@@ -326,7 +347,10 @@ public class BetterCryptoRsiEmaAlgo : QCAlgorithm
                 {
                     Log($"ACTION: EXIT SIGNAL (RSI Profit Take) for {symbol} at {Time}: RSI ({rsi.Current.Value:F2}) > {RSIOverbought}. Liquidating.");
                     Liquidate(symbol: symbol, tag: $"RSI > {RSIOverbought}");
-                    // Debug($"{Time} SELL {symbol} | RSI {rsi.Current:0.##} EMA-slope {calculatedEmaSlope:0.#####}");
+                    // if (_debug)
+                    // {
+                    //  Debug($"{Time} SELL {symbol} | RSI {rsi.Current:0.##} EMA-slope {calculatedEmaSlope:0.#####}");
+                    // }
                     // You might want a continue here if this exit should prevent the demo exit check
                     // continue;
                     exitedThisBar = true;
@@ -364,7 +388,10 @@ public class BetterCryptoRsiEmaAlgo : QCAlgorithm
                 if (exitedThisBar) continue; // Process next symbol
             }
         }
-        // Log($"DEBUG: OnData Post-Warmup Call #{_onDataCallCountAfterWarmup} COMPLETED at {Time}.");
+        // if (_debug)
+        // {
+        //  Log($"DEBUG: OnData Post-Warmup Call #{_onDataCallCountAfterWarmup} COMPLETED at {Time}.");
+        // }
     }
 
     public override void OnOrderEvent(OrderEvent orderEvent)
